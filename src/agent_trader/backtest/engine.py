@@ -1,9 +1,12 @@
 import asyncio
-import json
+import os
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+
+os.environ["CLAUDE_CODE_STREAM_CLOSE_TIMEOUT"] = "600000"
 
 import httpx
 import weave
@@ -11,6 +14,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 from loguru import logger
 
 from agent_trader.agent.prompts import build_system_prompt, build_user_prompt
+from agent_trader.agent.tool import create_recommendation_tool
 from agent_trader.backtest.evaluator import Evaluator
 from agent_trader.config import BacktestConfig
 from agent_trader.data.market import fetch_candles_for_chart
@@ -21,37 +25,12 @@ from agent_trader.models.post import TruthPost
 from agent_trader.models.recommendation import Recommendation
 from agent_trader.reporting.html_report import HtmlReport
 
-RECOMMENDATION_SCHEMA = {
-    "type": "json_schema",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "action": {"type": "string", "enum": ["signal", "skip"]},
-            "reasoning": {"type": "string"},
-            "importance_score": {"type": "integer"},
-            "market_analysis": {"type": "string"},
-            "predictions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "asset": {"type": "string"},
-                        "direction": {"type": "string", "enum": ["up", "down"]},
-                        "timeframe": {"type": "string", "enum": ["5m", "15m", "30m", "1h", "4h"]},
-                        "confidence": {"type": "string", "enum": ["high", "very_high"]},
-                    },
-                    "required": ["asset", "direction", "timeframe", "confidence"],
-                },
-            },
-        },
-        "required": ["action", "reasoning", "importance_score", "predictions"],
-    },
-}
-
 
 @dataclass
 class Worker:
     port: int
+    captured: dict[str, Recommendation | None]
+    mcp_server: object
     proxy_proc: subprocess.Popen | None = None
 
 
@@ -113,8 +92,10 @@ class BacktestEngine:
         workers = []
         for i in range(self.config.concurrency):
             port = self.config.proxy_base_port + i
+            captured: dict[str, Recommendation | None] = {"rec": None}
+            mcp_server = create_recommendation_tool(captured)
             proc = self._start_proxy(port)
-            workers.append(Worker(port=port, proxy_proc=proc))
+            workers.append(Worker(port=port, captured=captured, mcp_server=mcp_server, proxy_proc=proc))
         return workers
 
     def _start_proxy(self, port: int) -> subprocess.Popen | None:
@@ -123,9 +104,10 @@ class BacktestEngine:
             logger.warning(f"Proxy addon not found at {addon_path}, skipping proxy start")
             return None
 
+        mitmdump_path = str(Path(sys.executable).parent / "mitmdump")
         proc = subprocess.Popen(
             [
-                "mitmdump",
+                mitmdump_path,
                 "--listen-port", str(port),
                 "--set", f"data_dir={self.config.proxy_data_dir}",
                 "-s", str(addon_path),
@@ -135,6 +117,17 @@ class BacktestEngine:
             stderr=subprocess.DEVNULL,
         )
         logger.info(f"Started proxy on port {port} (pid={proc.pid})")
+
+        # Wait for proxy to be ready
+        import time as _time
+        for _ in range(20):
+            try:
+                httpx.get(f"http://localhost:{port}/__control/get_time", timeout=1)
+                logger.info(f"Proxy on port {port} ready")
+                return proc
+            except Exception:
+                _time.sleep(0.5)
+        logger.warning(f"Proxy on port {port} may not be ready")
         return proc
 
     def _stop_proxies(self, workers: list[Worker]):
@@ -147,12 +140,11 @@ class BacktestEngine:
         return ClaudeAgentOptions(
             model=self.config.model,
             system_prompt=self.system_prompt,
-            tools=["Bash"],
-            allowed_tools=["Bash"],
-            disallowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"],
+            mcp_servers={"trading": worker.mcp_server},
+            allowed_tools=["Bash", "mcp__trading__submit_recommendation"],
             permission_mode="bypassPermissions",
             max_budget_usd=self.config.max_budget_per_post_usd,
-            output_format=RECOMMENDATION_SCHEMA,
+            stderr=lambda line: logger.debug(f"CLI stderr: {line}"),
             sandbox={
                 "enabled": True,
                 "autoAllowBashIfSandboxed": True,
@@ -163,6 +155,7 @@ class BacktestEngine:
             env={
                 "SSL_CERT_FILE": self.ca_cert,
                 "REQUESTS_CA_BUNDLE": self.ca_cert,
+                "PATH": str(Path(sys.executable).parent) + ":" + "/usr/bin:/bin:/usr/sbin:/sbin",
             },
             cwd=str(Path.cwd()),
         )
@@ -198,22 +191,28 @@ class BacktestEngine:
             except Exception as e:
                 logger.warning(f"Failed to set proxy time for post {post.id}: {e}")
 
+        worker.captured["rec"] = None
         user_prompt = build_user_prompt(post, pp.prev_posts, pp.news_context)
         options = self._build_options(worker)
 
         cost = 0.0
         turns = 0
-        structured_output = None
         try:
             async for msg in query(prompt=user_prompt, options=options):
                 if isinstance(msg, ResultMessage):
                     cost = msg.total_cost_usd or 0.0
                     turns = msg.num_turns or 0
-                    structured_output = msg.structured_output
         except Exception as e:
             logger.error(f"Agent error on post {post.id}: {e}")
 
-        rec = self._parse_recommendation(structured_output)
+        rec = worker.captured["rec"]
+        if rec is None:
+            rec = Recommendation(
+                action="skip",
+                reasoning="Agent did not call submit_recommendation",
+                importance_score=1,
+                predictions=[],
+            )
 
         logger.info(
             f"Post {post.id} [{post.created_at:%Y-%m-%d %H:%M}]: "
@@ -248,24 +247,3 @@ class BacktestEngine:
             agent_turns=turns,
             chart_candles=chart_candles,
         )
-
-    def _parse_recommendation(self, structured_output) -> Recommendation:
-        if structured_output is None:
-            return Recommendation(
-                action="skip",
-                reasoning="Agent did not produce structured output",
-                importance_score=1,
-                predictions=[],
-            )
-
-        try:
-            data = structured_output if isinstance(structured_output, dict) else json.loads(structured_output)
-            return Recommendation.model_validate(data)
-        except Exception as e:
-            logger.warning(f"Failed to parse recommendation: {e} | raw: {str(structured_output)[:300]}")
-            return Recommendation(
-                action="skip",
-                reasoning=f"Failed to parse: {e}",
-                importance_score=1,
-                predictions=[],
-            )

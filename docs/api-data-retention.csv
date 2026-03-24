@@ -1,0 +1,48 @@
+exchange,endpoint,data_type,has_history,retention_1m,retention_max,earliest_data,notes
+Bybit,/v5/market/kline,OHLCV candles,yes,>6y all intervals,since inception,2020-03-25,no limit; all intervals 1m-M
+Bybit,/v5/market/mark-price-kline,mark price candles,yes,~6y rolling (2190d),~6y rolling,2020-03-25,rolling window per interval
+Bybit,/v5/market/index-price-kline,index price candles,yes,>5y all intervals,since inception,2020-03-25,no limit
+Bybit,/v5/market/premium-index-price-kline,premium index candles,yes,~6y all intervals,since inception,2020-03-25,no limit
+Bybit,/v5/market/funding/history,funding rates,yes,n/a (8h interval),since inception,2020-03-25,full history ~6y
+Bybit,/v5/market/open-interest,OI history,yes,n/a (5min min),since inception,2020-08-04,~5.6y; all intervals 5min-1d
+Bybit,/v5/market/account-ratio,long/short ratio,yes,n/a (5min min),>1y all periods,,all 6 periods retain >1y
+Bybit,/v5/market/historical-volatility,implied volatility (options),yes,n/a (hourly),2019-06 to 2025-12,2019-06-09,data stopped updating ~2025-12-26; category=option only
+Bybit,/v5/market/tickers,price/OI/funding snapshot,no,current only,current only,,no time params
+Bybit,/v5/market/orderbook,order book,no,current only,current only,,no historical API; ignores time params
+Bybit,/v5/market/recent-trade,recent trades,no,current only,current only,,ignores time params silently
+Bybit,/v5/market/time,server time,no,current only,current only,,
+Bybit,/v5/market/instruments-info,instrument specs,no,static,static,,tick size; leverage; lot size
+Bybit,/v5/market/risk-limit,risk limit tiers,no,static,static,,35 tiers for BTCUSDT
+Bybit,/v5/market/insurance,insurance fund,no,current only,current only,,59 pools; no time params
+Bybit,/v5/market/index-price-components,index components,no,current only,current only,,param: indexName not symbol
+Bybit,/v5/market/price-limit,order price limits,no,current only,current only,,
+Bybit,/v5/market/fee-group-info,fee structure,no,static,static,,8 fee groups; requires productType=contract
+Bybit,/v5/market/delivery-price,delivery prices,yes,historical,historical,,futures/options only
+Bybit,/v5/market/new-delivery-price,delivery (new format),yes,historical,historical,,options only (category=option)
+Bybit,/v5/market/rpi_orderbook,RPI orderbook,no,current only,current only,,limit param required
+Bybit,/v5/market/adlAlert,ADL warnings,no,current only,current only,,~680 items; updates every ~60s
+HyperLiquid,candleSnapshot,OHLCV candles,yes,~3.5d (5000 candles),1m:3.5d 5m:17d 15m:52d 30m:104d 1h:208d 2h:417d 4h:833d 8h+:all,,~5000 candle rolling cap per interval; retention = 5000 * interval_min / 1440 days
+HyperLiquid,fundingHistory,funding rates,yes,n/a (1h interval),since genesis,2023-05-12,no limit; 500 records/request; was 8h before 2023-06-08
+HyperLiquid,meta,perp metadata,no,static,static,,229 assets; margin tables; collateralToken
+HyperLiquid,metaAndAssetCtxs,meta + live context,no,current only,current only,,funding/OI/mark/mid price; ignores time params
+HyperLiquid,allMids,mid prices all assets,no,current only,current only,,532 entries; ignores time params
+HyperLiquid,l2Book,order book,no,current only,current only,,~10-12s latency; nSigFigs/mantissa for aggregation
+HyperLiquid,predictedFundings,predicted funding,no,current only,current only,,229 coins x 3 venues (HL/Binance/Bybit)
+HyperLiquid,perpsAtOpenInterestCap,assets at OI cap,no,current only,current only,,returns list of ticker strings
+HyperLiquid,spotMeta,spot metadata,no,static,static,,283 pairs; 448 tokens
+HyperLiquid,spotMetaAndAssetCtxs,spot meta + live,no,current only,current only,,no time params
+HyperLiquid,allPerpMetas,all perp metadata,no,static,static,,8 collateral groups; 375 perps total
+HyperLiquid,perpCategories,categories,no,static,static,,97 entries; [ticker; category] pairs
+HyperLiquid,perpAnnotation,perp annotation,no,static,static,,returns null for BTC/ETH currently
+HyperLiquid,perpConciseAnnotations,categories+keywords,no,static,static,,97 entries; stocks/commodities/indices/fx
+HyperLiquid,perpDexs,DEX list,no,static,static,,7 builder DEXs (xyz; flx; vntl; hyna; km; abcd; cash)
+HyperLiquid,perpDeployAuctionStatus,deploy auction,no,current only,current only,,Dutch auction for new perp deployment
+HyperLiquid,perpDexLimits,OI caps per DEX,no,current only,current only,,only builder DEXs; not 'hyperliquid'
+HyperLiquid,perpDexStatus,DEX status,no,broken,broken,,returns 500 for all dex values
+HyperLiquid,spotPairDeployAuctionStatus,spot auction,no,current only,current only,,
+HyperLiquid,vaultDetails,vault info,no,current only,current only,,includes portfolio history timeseries
+HyperLiquid,tokenDetails,token info,no,current only,current only,,tokenId must be hex string not int
+HyperLiquid,borrowLendReserveState,lending state,no,current only,current only,,token param is int index
+HyperLiquid,allBorrowLendReserveStates,all lending,no,current only,current only,,4 markets currently
+HyperLiquid,alignedQuoteTokenInfo,aligned token,no,current only,current only,,only USDH (token 360) returns data
+HyperLiquid,outcomeMeta,prediction markets,no,current only,current only,,empty on mainnet; data on testnet

@@ -17,6 +17,7 @@ dependencies = [
     "loguru>=0.7",
     "pandas>=3.0.1",
     "pyarrow>=23.0.1",
+    "mitmproxy>=12.2.1",
 ]
 
 [project.optional-dependencies]

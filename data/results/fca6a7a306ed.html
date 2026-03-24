@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backtest Report — fca6a7a306ed</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; }
+
+.header { background: #161b22; border-bottom: 1px solid #30363d; padding: 16px 24px; display: flex; gap: 32px; align-items: center; flex-wrap: wrap; }
+.header h1 { font-size: 18px; color: #f0f6fc; }
+.stat { text-align: center; }
+.stat .value { font-size: 24px; font-weight: 700; color: #f0f6fc; }
+.stat .label { font-size: 12px; color: #8b949e; text-transform: uppercase; }
+
+.container { display: flex; height: calc(100vh - 70px); }
+
+.sidebar { width: 340px; min-width: 340px; overflow-y: auto; border-right: 1px solid #30363d; background: #0d1117; }
+.sidebar-item { padding: 12px 16px; border-bottom: 1px solid #21262d; cursor: pointer; transition: background 0.15s; }
+.sidebar-item:hover { background: #161b22; }
+.sidebar-item.active { background: #1f6feb22; border-left: 3px solid #1f6feb; }
+.sidebar-item .date { font-size: 12px; color: #8b949e; }
+.sidebar-item .text { font-size: 13px; margin: 4px 0; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.sidebar-item .badges { display: flex; gap: 6px; flex-wrap: wrap; }
+.badge { font-size: 11px; padding: 2px 8px; border-radius: 12px; font-weight: 600; }
+.badge-correct { background: #238636; color: #fff; }
+.badge-incorrect { background: #da3633; color: #fff; }
+.badge-asset { background: #30363d; color: #c9d1d9; }
+
+.detail { flex: 1; overflow-y: auto; padding: 24px; }
+.detail-empty { display: flex; align-items: center; justify-content: center; height: 100%; color: #8b949e; font-size: 16px; }
+
+.post-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+.post-card h2 { font-size: 14px; color: #8b949e; margin-bottom: 8px; }
+.post-text { font-size: 15px; line-height: 1.6; white-space: pre-wrap; }
+.post-meta { display: flex; gap: 16px; margin-top: 12px; font-size: 12px; color: #8b949e; }
+
+.section { margin-bottom: 16px; }
+.section h3 { font-size: 14px; color: #8b949e; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+.reasoning { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; font-size: 14px; line-height: 1.6; white-space: pre-wrap; }
+
+table.predictions { width: 100%; border-collapse: collapse; background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
+table.predictions th { background: #21262d; padding: 8px 12px; text-align: left; font-size: 12px; color: #8b949e; text-transform: uppercase; }
+table.predictions td { padding: 8px 12px; border-top: 1px solid #21262d; font-size: 13px; }
+
+.outcome { text-align: center; padding: 16px; border-radius: 8px; margin-bottom: 16px; font-size: 18px; font-weight: 700; }
+.outcome-correct { background: #23863622; border: 1px solid #238636; color: #3fb950; }
+.outcome-incorrect { background: #da363322; border: 1px solid #da3633; color: #f85149; }
+
+.chart-tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+.chart-tab { padding: 6px 16px; background: #21262d; border: 1px solid #30363d; border-radius: 6px; cursor: pointer; font-size: 13px; color: #c9d1d9; }
+.chart-tab.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+
+.no-signals { text-align: center; padding: 60px 20px; color: #8b949e; font-size: 18px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Backtest Report</h1>
+  <div class="stat"><div class="value" id="stat-posts"></div><div class="label">Posts</div></div>
+  <div class="stat"><div class="value" id="stat-signals"></div><div class="label">Signals</div></div>
+  <div class="stat"><div class="value" id="stat-accuracy"></div><div class="label">Direction Accuracy</div></div>
+  <div class="stat"><div class="value" id="stat-cost"></div><div class="label">Agent Cost</div></div>
+</div>
+
+<div class="container">
+  <div class="sidebar" id="sidebar"></div>
+  <div class="detail" id="detail">
+    <div class="detail-empty">Select a signal post from the left panel</div>
+  </div>
+</div>
+
+<script>
+const DATA = {"summary": {"posts_total": 1, "posts_with_signal": 0, "signal_rate_pct": 0.0, "direction_accuracy_pct": 0, "total_cost": 0.328967, "total_correct": 0, "total_evaluated": 0}, "signal_posts": []};
+
+// Header stats
+const s = DATA.summary;
+document.getElementById('stat-posts').textContent = `${s.posts_total} → ${s.posts_with_signal} signals (${s.signal_rate_pct.toFixed(1)}%)`;
+document.getElementById('stat-signals').textContent = s.posts_with_signal;
+document.getElementById('stat-accuracy').textContent = `${s.direction_accuracy_pct.toFixed(0)}%`;
+document.getElementById('stat-cost').textContent = `$${s.total_cost.toFixed(2)}`;
+
+// Sidebar
+const sidebar = document.getElementById('sidebar');
+if (DATA.signal_posts.length === 0) {
+  sidebar.innerHTML = '<div class="no-signals">No signals generated</div>';
+}
+DATA.signal_posts.forEach((sp, idx) => {
+  const correct = sp.predictions.filter(p => p.direction_correct).length;
+  const total = sp.predictions.length;
+  const allCorrect = correct === total;
+
+  const div = document.createElement('div');
+  div.className = 'sidebar-item';
+  div.dataset.idx = idx;
+
+  const assetBadges = sp.predictions.map(p =>
+    `<span class="badge badge-asset">${p.asset} ${p.direction === 'up' ? '↑' : '↓'}</span>`
+  ).join('');
+  const resultBadge = `<span class="badge ${allCorrect ? 'badge-correct' : 'badge-incorrect'}">${correct}/${total}</span>`;
+
+  div.innerHTML = `
+    <div class="date">${sp.post_date}</div>
+    <div class="text">${escapeHtml(sp.post_text)}</div>
+    <div class="badges">${assetBadges}${resultBadge}</div>
+  `;
+  div.onclick = () => showDetail(idx);
+  sidebar.appendChild(div);
+});
+
+function escapeHtml(text) {
+  const d = document.createElement('div');
+  d.textContent = text;
+  return d.innerHTML;
+}
+
+function showDetail(idx) {
+  document.querySelectorAll('.sidebar-item').forEach(el => el.classList.remove('active'));
+  document.querySelector(`.sidebar-item[data-idx="${idx}"]`).classList.add('active');
+
+  const sp = DATA.signal_posts[idx];
+  const detail = document.getElementById('detail');
+
+  const correct = sp.predictions.filter(p => p.direction_correct).length;
+  const total = sp.predictions.length;
+  const allCorrect = correct === total;
+
+  let predRows = sp.predictions.map(p => `
+    <tr>
+      <td>${p.asset}</td>
+      <td>${p.direction === 'up' ? '↑ Up' : '↓ Down'}</td>
+      <td>${p.timeframe}</td>
+      <td>${p.confidence}</td>
+      <td style="color:${p.direction_correct ? '#3fb950' : '#f85149'}">${p.actual_change_pct.toFixed(2)}%</td>
+      <td>${p.direction_correct ? '✓' : '✗'}</td>
+    </tr>
+  `).join('');
+
+  const chartAssets = Object.keys(sp.chart_data || {});
+  const chartTabs = chartAssets.map((a, i) =>
+    `<div class="chart-tab ${i === 0 ? 'active' : ''}" onclick="switchChart(${idx}, '${a}', this)">${a}</div>`
+  ).join('');
+
+  detail.innerHTML = `
+    <div class="outcome ${allCorrect ? 'outcome-correct' : 'outcome-incorrect'}">
+      ${allCorrect ? 'CORRECT ✓' : 'INCORRECT ✗'} — ${correct}/${total} predictions correct
+    </div>
+
+    <div class="post-card">
+      <h2>Post</h2>
+      <div class="post-text">${escapeHtml(sp.post_text)}</div>
+      <div class="post-meta">
+        <span>${sp.post_date}</span>
+        <span>Engagement: ${sp.engagement}</span>
+        <span>Importance: ${sp.importance}/10</span>
+      </div>
+    </div>
+
+    <div class="section">
+      <h3>Agent Reasoning</h3>
+      <div class="reasoning">${escapeHtml(sp.reasoning)}</div>
+    </div>
+
+    ${sp.market_analysis ? `
+    <div class="section">
+      <h3>Market Analysis</h3>
+      <div class="reasoning">${escapeHtml(sp.market_analysis)}</div>
+    </div>` : ''}
+
+    <div class="section">
+      <h3>Predictions</h3>
+      <table class="predictions">
+        <tr><th>Asset</th><th>Direction</th><th>Timeframe</th><th>Confidence</th><th>Actual Δ</th><th>Result</th></tr>
+        ${predRows}
+      </table>
+    </div>
+
+    ${chartAssets.length > 0 ? `
+    <div class="section">
+      <h3>Price Chart</h3>
+      <div class="chart-tabs">${chartTabs}</div>
+      <div id="chart-container" style="width:100%;height:400px;"></div>
+    </div>` : ''}
+  `;
+
+  if (chartAssets.length > 0) {
+    renderChart(sp, chartAssets[0]);
+  }
+}
+
+function switchChart(idx, asset, tabEl) {
+  document.querySelectorAll('.chart-tab').forEach(t => t.classList.remove('active'));
+  tabEl.classList.add('active');
+  renderChart(DATA.signal_posts[idx], asset);
+}
+
+function renderChart(sp, asset) {
+  const cd = sp.chart_data[asset];
+  if (!cd || !cd.candles.length) return;
+
+  const candles = cd.candles;
+  const dates = candles.map(c => new Date(c[0]));
+  const opens = candles.map(c => c[1]);
+  const highs = candles.map(c => c[2]);
+  const lows = candles.map(c => c[3]);
+  const closes = candles.map(c => c[4]);
+
+  const postTime = new Date(cd.post_timestamp_ms);
+
+  const trace = {
+    x: dates, open: opens, high: highs, low: lows, close: closes,
+    type: 'candlestick',
+    increasing: { line: { color: '#3fb950' } },
+    decreasing: { line: { color: '#f85149' } },
+  };
+
+  const layout = {
+    paper_bgcolor: '#0d1117',
+    plot_bgcolor: '#0d1117',
+    font: { color: '#c9d1d9' },
+    xaxis: { gridcolor: '#21262d', rangeslider: { visible: false } },
+    yaxis: { gridcolor: '#21262d', title: asset + ' Price' },
+    shapes: [{
+      type: 'line', x0: postTime, x1: postTime,
+      y0: 0, y1: 1, yref: 'paper',
+      line: { color: '#f85149', width: 2, dash: 'dash' },
+    }],
+    annotations: [{
+      x: postTime, y: 1.02, yref: 'paper',
+      text: 'Trump posted', showarrow: false,
+      font: { color: '#f85149', size: 12 },
+    }],
+    margin: { l: 60, r: 20, t: 20, b: 40 },
+  };
+
+  Plotly.newPlot('chart-container', [trace], layout, { responsive: true });
+}
+
+// Auto-select first item
+if (DATA.signal_posts.length > 0) showDetail(0);
+</script>
+</body>
+</html>
