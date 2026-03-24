@@ -1,0 +1,36 @@
+from typing import Literal, Self
+
+from pydantic import BaseModel, Field, model_validator
+
+from agent_trader.constants import VALID_HL_ASSETS
+
+
+class AssetPrediction(BaseModel):
+    asset: str
+    direction: Literal["up", "down"]
+    timeframe: Literal["5m", "15m", "30m", "1h", "4h"]
+    confidence: Literal["high", "very_high"]
+
+    @model_validator(mode="after")
+    def validate_asset(self) -> Self:
+        if self.asset not in VALID_HL_ASSETS:
+            raise ValueError(f"Unknown asset: {self.asset}. Must be a valid HyperLiquid perp ticker.")
+        return self
+
+
+class Recommendation(BaseModel):
+    action: Literal["signal", "skip"]
+    reasoning: str = Field(min_length=20)
+    importance_score: int = Field(ge=1, le=10)
+    predictions: list[AssetPrediction] = Field(default_factory=list, max_length=3)
+    market_analysis: str = Field(default="")
+
+    @model_validator(mode="after")
+    def validate_consistency(self) -> Self:
+        if self.action == "skip" and self.predictions:
+            raise ValueError("action='skip' must have empty predictions")
+        if self.action == "signal" and not self.predictions:
+            raise ValueError("action='signal' must have at least one prediction")
+        if self.importance_score < 7 and self.action == "signal":
+            raise ValueError("importance_score < 7 requires action='skip'")
+        return self
