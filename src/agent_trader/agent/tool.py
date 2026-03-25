@@ -79,6 +79,8 @@ def create_recommendation_tool(captured: dict[str, Recommendation | None]):
                 "is_error": True,
             }
 
+        if captured["rec"] is not None:
+            logger.warning("submit_recommendation called again, overwriting previous")
         captured["rec"] = rec
         logger.info(f"submit_recommendation captured: action={rec.action} importance={rec.importance_score}")
         return {
