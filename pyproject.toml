@@ -18,6 +18,8 @@ dependencies = [
     "pandas>=3.0.1",
     "pyarrow>=23.0.1",
     "mitmproxy>=12.2.1",
+    "boto3>=1.35",
+    "lz4>=4.3",
 ]
 
 [project.optional-dependencies]
