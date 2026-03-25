@@ -104,6 +104,13 @@ class BacktestEngine:
             logger.warning(f"Proxy addon not found at {addon_path}, skipping proxy start")
             return None
 
+        data_dir = Path(self.config.proxy_data_dir)
+        for required in ("meta.json", "allPerpMetas.json", "spotMeta.json"):
+            if not (data_dir / required).exists():
+                raise FileNotFoundError(
+                    f"Missing {data_dir / required}. Run: python scripts/collect_snapshots.py"
+                )
+
         mitmdump_path = str(Path(sys.executable).parent / "mitmdump")
         proc = subprocess.Popen(
             [
@@ -134,7 +141,11 @@ class BacktestEngine:
         for w in workers:
             if w.proxy_proc and w.proxy_proc.poll() is None:
                 w.proxy_proc.terminate()
-                w.proxy_proc.wait(timeout=5)
+                try:
+                    w.proxy_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    w.proxy_proc.kill()
+                    w.proxy_proc.wait()
 
     def _build_options(self, worker: Worker) -> ClaudeAgentOptions:
         return ClaudeAgentOptions(
