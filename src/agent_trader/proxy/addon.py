@@ -8,17 +8,15 @@ Usage:
     mitmdump --listen-port 8080 -s src/agent_trader/proxy/addon.py --set data_dir=data/proxy_snapshots
 """
 
+import asyncio
 import json
-import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import httpx
 from mitmproxy import ctx, http
 
-# ---------------------------------------------------------------------------
-# Bybit endpoint classifications
-# ---------------------------------------------------------------------------
+from agent_trader.data.market import fetch_candles
 
 BYBIT_TIME_CAP_END = {
     "/v5/market/kline",
@@ -52,15 +50,11 @@ BYBIT_BLOCK = {
     "/v5/market/adlAlert",
 }
 
-# ---------------------------------------------------------------------------
-# HyperLiquid type classifications
-# ---------------------------------------------------------------------------
+HL_TIME_CAP = {"fundingHistory"}
 
-HL_TIME_CAP = {"candleSnapshot", "fundingHistory"}
+HL_INTERCEPT = {"candleSnapshot", "allMids", "metaAndAssetCtxs", "spotMetaAndAssetCtxs"}
 
-HL_FROM_LOCAL_FILE = {
-    "meta", "metaAndAssetCtxs", "allPerpMetas", "spotMeta", "spotMetaAndAssetCtxs",
-}
+HL_FROM_LOCAL_FILE = {"meta", "allPerpMetas", "spotMeta"}
 
 HL_PASSTHROUGH = {"perpCategories", "perpAnnotation", "perpConciseAnnotations"}
 
@@ -71,6 +65,8 @@ HL_BLOCK = {
     "vaultDetails", "tokenDetails", "borrowLendReserveState",
     "allBorrowLendReserveStates", "alignedQuoteTokenInfo", "outcomeMeta",
 }
+
+FETCH_SEMAPHORE = asyncio.Semaphore(50)
 
 
 def _json_response(flow: http.HTTPFlow, data, status: int = 200):
@@ -86,9 +82,9 @@ def _block(flow: http.HTTPFlow, reason: str):
 
 class BacktestProxy:
     def __init__(self):
-        self.T: int | None = None  # backtest time in ms
+        self.T: int | None = None
         self.data_dir: Path | None = None
-        self._client = httpx.Client(timeout=15)
+        self._client: httpx.AsyncClient | None = None
 
     def load(self, loader):
         loader.add_option("data_dir", str, "", "Path to pre-collected proxy snapshots")
@@ -99,31 +95,28 @@ class BacktestProxy:
             if d:
                 self.data_dir = Path(d)
 
-    def request(self, flow: http.HTTPFlow):
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=15)
+        return self._client
+
+    async def request(self, flow: http.HTTPFlow):
         host = flow.request.pretty_host
         path = flow.request.path.split("?")[0]
 
-        # --- Control endpoint ---
         if "/__control/" in flow.request.path:
             self._handle_control(flow)
             return
 
-        # --- Bybit ---
         if "api.bybit.com" in host:
-            self._handle_bybit(flow, path)
+            await self._handle_bybit(flow, path)
             return
 
-        # --- HyperLiquid ---
         if "api.hyperliquid.xyz" in host:
-            self._handle_hyperliquid(flow)
+            await self._handle_hyperliquid(flow)
             return
 
-        # --- Everything else: block ---
         _block(flow, f"Domain not allowed: {host}")
-
-    # -----------------------------------------------------------------------
-    # Control
-    # -----------------------------------------------------------------------
 
     def _handle_control(self, flow: http.HTTPFlow):
         path = flow.request.path
@@ -140,28 +133,25 @@ class BacktestProxy:
         else:
             _json_response(flow, {"error": "unknown control endpoint"}, 404)
 
-    # -----------------------------------------------------------------------
-    # Bybit
-    # -----------------------------------------------------------------------
+    # --- Bybit ---
 
-    def _handle_bybit(self, flow: http.HTTPFlow, path: str):
+    async def _handle_bybit(self, flow: http.HTTPFlow, path: str):
         if path in BYBIT_TIME_CAP_END:
             self._bybit_time_cap(flow, "end")
         elif path in BYBIT_TIME_CAP_ENDTIME:
             self._bybit_time_cap(flow, "endTime")
         elif path == "/v5/market/tickers":
-            self._bybit_intercept_tickers(flow)
+            await self._bybit_intercept_tickers(flow)
         elif path == "/v5/market/time":
             self._bybit_intercept_time(flow)
         elif path in BYBIT_PASSTHROUGH:
-            pass  # let mitmproxy forward as-is
+            pass
         elif path in BYBIT_BLOCK:
             _block(flow, f"Bybit endpoint blocked: {path}")
         else:
             _block(flow, f"Unknown Bybit endpoint: {path}")
 
     def _bybit_time_cap(self, flow: http.HTTPFlow, param_name: str):
-        """Inject time cap into query params so response contains no future data."""
         if self.T is None:
             _block(flow, "Backtest time not set")
             return
@@ -169,7 +159,6 @@ class BacktestProxy:
         parsed = urlparse(flow.request.url)
         params = parse_qs(parsed.query, keep_blank_values=True)
 
-        # Cap the end time parameter
         current_end = params.get(param_name, [None])[0]
         if current_end is None or int(current_end) > self.T:
             params[param_name] = [str(self.T)]
@@ -178,20 +167,18 @@ class BacktestProxy:
         flow.request.url = urlunparse(parsed._replace(query=new_query))
 
     def _bybit_intercept_time(self, flow: http.HTTPFlow):
-        """Return backtest time T instead of real server time."""
         if self.T is None:
             _block(flow, "Backtest time not set")
             return
         t_sec = self.T // 1000
-        t_nano = str(self.T * 1_000_000)  # ms → ns
+        t_nano = str(self.T * 1_000_000)
         _json_response(flow, {
             "retCode": 0, "retMsg": "OK",
             "result": {"timeSecond": str(t_sec), "timeNano": t_nano},
             "retExtInfo": {}, "time": self.T,
         })
 
-    def _bybit_intercept_tickers(self, flow: http.HTTPFlow):
-        """Construct ticker from kline + funding/history + open-interest at T."""
+    async def _bybit_intercept_tickers(self, flow: http.HTTPFlow):
         if self.T is None:
             _block(flow, "Backtest time not set")
             return
@@ -206,34 +193,30 @@ class BacktestProxy:
             return
 
         try:
-            # Fetch last kline candle at T
-            kline_resp = self._client.get(
-                "https://api.bybit.com/v5/market/kline",
-                params={"category": category, "symbol": symbol, "interval": "1", "end": str(self.T), "limit": "1"},
-            )
-            kline_data = kline_resp.json()
-            kline_list = kline_data.get("result", {}).get("list", [])
+            client = await self._get_client()
 
-            last_price = "0"
-            if kline_list:
-                last_price = kline_list[0][4]  # close price
-
-            # Fetch latest funding rate
-            funding_resp = self._client.get(
-                "https://api.bybit.com/v5/market/funding/history",
-                params={"category": category, "symbol": symbol, "endTime": str(self.T), "limit": "1"},
+            kline_resp, funding_resp, oi_resp = await asyncio.gather(
+                client.get("https://api.bybit.com/v5/market/kline", params={
+                    "category": category, "symbol": symbol, "interval": "1",
+                    "end": str(self.T), "limit": "1",
+                }),
+                client.get("https://api.bybit.com/v5/market/funding/history", params={
+                    "category": category, "symbol": symbol,
+                    "endTime": str(self.T), "limit": "1",
+                }),
+                client.get("https://api.bybit.com/v5/market/open-interest", params={
+                    "category": category, "symbol": symbol,
+                    "intervalTime": "5min", "endTime": str(self.T), "limit": "1",
+                }),
             )
-            funding_data = funding_resp.json()
-            funding_list = funding_data.get("result", {}).get("list", [])
+
+            kline_list = kline_resp.json().get("result", {}).get("list", [])
+            last_price = kline_list[0][4] if kline_list else "0"
+
+            funding_list = funding_resp.json().get("result", {}).get("list", [])
             funding_rate = funding_list[0]["fundingRate"] if funding_list else "0"
 
-            # Fetch OI
-            oi_resp = self._client.get(
-                "https://api.bybit.com/v5/market/open-interest",
-                params={"category": category, "symbol": symbol, "intervalTime": "5min", "endTime": str(self.T), "limit": "1"},
-            )
-            oi_data = oi_resp.json()
-            oi_list = oi_data.get("result", {}).get("list", [])
+            oi_list = oi_resp.json().get("result", {}).get("list", [])
             oi_value = oi_list[0]["openInterest"] if oi_list else "0"
 
             ticker = {
@@ -265,11 +248,9 @@ class BacktestProxy:
             ctx.log.error(f"tickers intercept failed: {e}")
             _block(flow, f"tickers intercept failed: {e}")
 
-    # -----------------------------------------------------------------------
-    # HyperLiquid
-    # -----------------------------------------------------------------------
+    # --- HyperLiquid ---
 
-    def _handle_hyperliquid(self, flow: http.HTTPFlow):
+    async def _handle_hyperliquid(self, flow: http.HTTPFlow):
         if flow.request.method != "POST":
             _block(flow, "HyperLiquid only accepts POST")
             return
@@ -284,93 +265,158 @@ class BacktestProxy:
 
         if req_type in HL_TIME_CAP:
             self._hl_time_cap(flow, body, req_type)
-        elif req_type == "allMids":
-            self._hl_approximate_all_mids(flow, body)
+        elif req_type in HL_INTERCEPT:
+            await self._hl_intercept(flow, body, req_type)
         elif req_type in HL_FROM_LOCAL_FILE:
             self._hl_from_local_file(flow, body, req_type)
         elif req_type in HL_PASSTHROUGH:
-            pass  # let mitmproxy forward as-is
+            pass
         elif req_type in HL_BLOCK:
             _block(flow, f"HyperLiquid type blocked: {req_type}")
         else:
             _block(flow, f"Unknown HyperLiquid type: {req_type}")
 
     def _hl_time_cap(self, flow: http.HTTPFlow, body: dict, req_type: str):
-        """Inject endTime=T into the request body."""
         if self.T is None:
             _block(flow, "Backtest time not set")
             return
 
-        if req_type == "candleSnapshot":
-            req = body.get("req", {})
-            current_end = req.get("endTime")
-            if current_end is None or int(current_end) > self.T:
-                req["endTime"] = self.T
-                body["req"] = req
-        elif req_type == "fundingHistory":
+        if req_type == "fundingHistory":
             current_end = body.get("endTime")
             if current_end is None or int(current_end) > self.T:
                 body["endTime"] = self.T
 
         flow.request.content = json.dumps(body).encode()
 
-    def _hl_from_local_file(self, flow: http.HTTPFlow, body: dict, req_type: str):
-        """Serve from pre-collected local snapshot file."""
-        if self.data_dir is None:
-            # Fallback: passthrough to real API
-            ctx.log.warn(f"No data_dir set, passing through {req_type}")
-            return
-
-        file_path = self.data_dir / f"{req_type}.json"
-        if not file_path.exists():
-            # Fallback: passthrough
-            ctx.log.warn(f"Snapshot not found: {file_path}, passing through")
-            return
-
-        data = json.loads(file_path.read_text())
-        _json_response(flow, data)
-
-    def _hl_approximate_all_mids(self, flow: http.HTTPFlow, body: dict):
-        """Approximate allMids from candleSnapshot close prices at T."""
+    async def _hl_intercept(self, flow: http.HTTPFlow, body: dict, req_type: str):
         if self.T is None:
             _block(flow, "Backtest time not set")
             return
 
-        try:
-            # Fetch meta to get asset list
-            meta_resp = self._client.post(
-                "https://api.hyperliquid.xyz/info",
-                json={"type": "meta"},
-            )
-            meta = meta_resp.json()
-            assets = [u["name"] for u in meta.get("universe", [])]
+        if req_type == "candleSnapshot":
+            await self._hl_intercept_candles(flow, body)
+        elif req_type == "allMids":
+            await self._hl_intercept_all_mids(flow)
+        elif req_type in ("metaAndAssetCtxs", "spotMetaAndAssetCtxs"):
+            await self._hl_intercept_meta_and_ctxs(flow, body, req_type)
 
-            mids = {}
-            # Fetch close prices for top assets (batch to avoid too many requests)
-            for asset in assets[:50]:
+    async def _hl_intercept_candles(self, flow: http.HTTPFlow, body: dict):
+
+        req = body.get("req", {})
+        coin = req.get("coin", "")
+        interval = req.get("interval", "1m")
+        start_time = int(req.get("startTime", 0))
+        end_time = min(int(req.get("endTime", self.T)), self.T)
+
+        candles = await fetch_candles(coin, start_time, end_time, interval)
+
+        hl_format = [
+            {"t": c.timestamp_ms, "o": str(c.open), "h": str(c.high),
+             "l": str(c.low), "c": str(c.close), "v": str(c.volume)}
+            for c in candles
+        ]
+        _json_response(flow, hl_format)
+
+    async def _hl_intercept_all_mids(self, flow: http.HTTPFlow):
+
+        if not self.data_dir or not (self.data_dir / "allPerpMetas.json").exists():
+            _block(flow, "allPerpMetas.json not found. Run: python scripts/collect_snapshots.py")
+            return
+
+        all_metas = json.loads((self.data_dir / "allPerpMetas.json").read_text())
+        assets = []
+        for group in all_metas:
+            for u in group.get("universe", []):
+                assets.append(u["name"])
+
+        async def _get_mid(asset: str) -> tuple[str, str | None]:
+            async with FETCH_SEMAPHORE:
                 try:
-                    resp = self._client.post(
-                        "https://api.hyperliquid.xyz/info",
-                        json={
-                            "type": "candleSnapshot",
-                            "req": {
-                                "coin": asset,
-                                "interval": "1m",
-                                "startTime": self.T - 60_000,
-                                "endTime": self.T,
-                            },
-                        },
-                    )
-                    candles = resp.json()
+                    candles = await fetch_candles(asset, self.T - 60_000, self.T, "1m")
                     if candles:
-                        mids[asset] = candles[-1]["c"]
+                        return asset, candles[-1].close
                 except Exception:
-                    continue
+                    pass
+                return asset, None
 
-            _json_response(flow, mids)
-        except Exception as e:
-            ctx.log.error(f"allMids approximation failed: {e}")
-            _block(flow, f"allMids approximation failed: {e}")
+        results = await asyncio.gather(*[_get_mid(a) for a in assets])
+        mids = {asset: str(price) for asset, price in results if price is not None}
+        _json_response(flow, mids)
+
+    async def _hl_intercept_meta_and_ctxs(self, flow: http.HTTPFlow, body: dict, req_type: str):
+
+        if req_type == "spotMetaAndAssetCtxs":
+            if self.data_dir and (self.data_dir / "spotMeta.json").exists():
+                data = json.loads((self.data_dir / "spotMeta.json").read_text())
+                _json_response(flow, [data, []])
+            else:
+                _block(flow, "spotMeta.json not found")
+            return
+
+        if not self.data_dir or not (self.data_dir / "meta.json").exists():
+            _block(flow, "meta.json not found. Run: python scripts/collect_snapshots.py")
+            return
+
+        meta = json.loads((self.data_dir / "meta.json").read_text())
+        assets = [u["name"] for u in meta.get("universe", [])]
+
+        async def _get_ctx(asset: str) -> dict:
+            async with FETCH_SEMAPHORE:
+                mark_price = None
+                funding = "0"
+                open_interest = "0"
+                try:
+                    candles = await fetch_candles(asset, self.T - 60_000, self.T, "1m")
+                    if candles:
+                        mark_price = _fmt(candles[-1].close)
+                except Exception:
+                    pass
+
+                if mark_price is None:
+                    mark_price = "0"
+
+                try:
+                    client = await self._get_client()
+                    resp = await client.post("https://api.hyperliquid.xyz/info", json={
+                        "type": "fundingHistory", "coin": asset,
+                        "startTime": self.T - 8 * 3600_000, "endTime": self.T,
+                    })
+                    fh = resp.json()
+                    if fh:
+                        funding = fh[-1].get("fundingRate", "0")
+                except Exception:
+                    pass
+
+                return {
+                    "funding": funding,
+                    "openInterest": open_interest,
+                    "prevDayPx": mark_price,
+                    "dayNtlVlm": "0",
+                    "premium": "0",
+                    "oraclePx": mark_price,
+                    "markPx": mark_price,
+                    "midPx": mark_price,
+                    "impactPxs": [mark_price, mark_price],
+                }
+
+        ctxs = await asyncio.wait_for(
+            asyncio.gather(*[_get_ctx(a) for a in assets]),
+            timeout=60,
+        )
+        _json_response(flow, [meta, list(ctxs)])
+
+    def _hl_from_local_file(self, flow: http.HTTPFlow, body: dict, req_type: str):
+        if self.data_dir is None:
+            _block(flow, f"No data_dir set, cannot serve {req_type}")
+            return
+
+        file_path = self.data_dir / f"{req_type}.json"
+        if not file_path.exists():
+            _block(flow, f"Snapshot not found: {file_path}. Run: python scripts/collect_snapshots.py")
+            return
+
+        data = json.loads(file_path.read_text())
+        _json_response(flow, data)
 
 
 addons = [BacktestProxy()]
