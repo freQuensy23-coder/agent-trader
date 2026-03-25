@@ -1,5 +1,8 @@
 .venv
 .env
 ralf.sh
+__pycache__/
 data/news/
+data/cache/
+data/results/
 
