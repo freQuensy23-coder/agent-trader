@@ -17,14 +17,13 @@ class Candle(BaseModel):
     volume: float
 
 
-async def fetch_candles(
+async def _fetch_hl_candles(
     asset: str,
     start_ms: int,
     end_ms: int,
     interval: str = "1m",
     client: httpx.AsyncClient | None = None,
 ) -> list[Candle]:
-    """Fetch OHLCV candles from HyperLiquid. Handles pagination (max 500 per request)."""
     own_client = client is None
     if own_client:
         client = httpx.AsyncClient(timeout=30)
@@ -51,15 +50,16 @@ async def fetch_candles(
                 break
 
             for c in data:
-                candle = Candle(
-                    timestamp_ms=c["t"],
-                    open=float(c["o"]),
-                    high=float(c["h"]),
-                    low=float(c["l"]),
-                    close=float(c["c"]),
-                    volume=float(c["v"]),
+                all_candles.append(
+                    Candle(
+                        timestamp_ms=c["t"],
+                        open=float(c["o"]),
+                        high=float(c["h"]),
+                        low=float(c["l"]),
+                        close=float(c["c"]),
+                        volume=float(c["v"]),
+                    )
                 )
-                all_candles.append(candle)
 
             if len(data) < MAX_CANDLES_PER_REQUEST:
                 break
@@ -72,13 +72,55 @@ async def fetch_candles(
     return all_candles
 
 
+async def fetch_candles(
+    asset: str,
+    start_ms: int,
+    end_ms: int,
+    interval: str = "1m",
+    client: httpx.AsyncClient | None = None,
+) -> list[Candle]:
+    from agent_trader.data.bybit import fetch_bybit_candles
+    from agent_trader.data.cache import load_cached_candles, save_to_cache
+
+    cached = load_cached_candles(asset, interval, start_ms, end_ms)
+    if cached:
+        logger.debug(f"Cache hit: {asset}/{interval} ({len(cached)} candles)")
+        return cached
+
+    candles = await fetch_bybit_candles(asset, start_ms, end_ms, interval, client)
+    if candles:
+        logger.debug(f"Bybit: {asset}/{interval} → {len(candles)} candles")
+        save_to_cache(asset, interval, candles)
+        return candles
+
+    try:
+        candles = await _fetch_hl_candles(asset, start_ms, end_ms, interval, client)
+    except Exception as e:
+        logger.debug(f"HL API error for {asset}/{interval}: {e}")
+        candles = []
+    if candles:
+        logger.debug(f"HL API: {asset}/{interval} → {len(candles)} candles")
+        save_to_cache(asset, interval, candles)
+        return candles
+
+    from agent_trader.data.s3_fills import fetch_s3_candles
+
+    candles = await fetch_s3_candles(asset, start_ms, end_ms, interval)
+    if candles:
+        logger.debug(f"S3 fills: {asset}/{interval} → {len(candles)} candles")
+        save_to_cache(asset, interval, candles)
+        return candles
+
+    logger.warning(f"No candle data: {asset}/{interval} [{start_ms}..{end_ms}]")
+    return []
+
+
 async def fetch_price_change(
     asset: str,
     from_ms: int,
     timeframe: str,
     client: httpx.AsyncClient | None = None,
 ) -> tuple[float, float, float]:
-    """Returns (price_at_post, price_after, change_pct)."""
     to_ms = from_ms + TIMEFRAME_MS[timeframe]
 
     candles_at = await fetch_candles(asset, from_ms, from_ms + 60_000, "1m", client)
@@ -101,7 +143,6 @@ async def fetch_candles_for_chart(
     timeframe: str,
     client: httpx.AsyncClient | None = None,
 ) -> list[Candle]:
-    """Fetch candles for HTML chart: window around post based on timeframe."""
     window = CHART_WINDOW[timeframe]
     start_ms = post_ms - window["pad_ms"]
     end_ms = post_ms + window["pad_ms"]

@@ -1,8 +1,22 @@
+import json
+from functools import lru_cache
+from pathlib import Path
 from typing import Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
 
-from agent_trader.constants import VALID_HL_ASSETS
+
+@lru_cache(maxsize=1)
+def _load_valid_assets() -> frozenset[str]:
+    path = Path("data/proxy_snapshots/allPerpMetas.json")
+    if not path.exists():
+        return frozenset()
+    data = json.loads(path.read_text())
+    assets = set()
+    for group in data:
+        for u in group.get("universe", []):
+            assets.add(u["name"])
+    return frozenset(assets)
 
 
 class AssetPrediction(BaseModel):
@@ -13,7 +27,8 @@ class AssetPrediction(BaseModel):
 
     @model_validator(mode="after")
     def validate_asset(self) -> Self:
-        if self.asset not in VALID_HL_ASSETS:
+        valid = _load_valid_assets()
+        if valid and self.asset not in valid:
             raise ValueError(f"Unknown asset: {self.asset}. Must be a valid HyperLiquid perp ticker.")
         return self
 
