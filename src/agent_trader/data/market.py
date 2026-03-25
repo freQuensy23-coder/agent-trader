@@ -126,7 +126,7 @@ async def fetch_price_change(
     candles_at = await fetch_candles(asset, from_ms, from_ms + 60_000, "1m", client)
     if not candles_at:
         raise ValueError(f"No candle data for {asset} at {from_ms}")
-    price_at_post = candles_at[0].close
+    price_at_post = candles_at[0].open
 
     candles_after = await fetch_candles(asset, to_ms, to_ms + 60_000, "1m", client)
     if not candles_after:
