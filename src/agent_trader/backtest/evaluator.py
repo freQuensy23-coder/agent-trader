@@ -23,6 +23,17 @@ class Evaluator:
                 )
             except Exception as e:
                 logger.warning(f"No price data for {pred.asset} @ {post.created_at_ms}: {e}")
+                outcomes.append(PredictionOutcome(
+                    prediction=pred,
+                    actual_price_at_post=0.0,
+                    actual_price_after=0.0,
+                    actual_change_pct=0.0,
+                    direction_correct=False,
+                    post_id=post.id,
+                    post_text=post.text,
+                    skipped=True,
+                    skip_reason=str(e),
+                ))
                 continue
 
             direction_correct = (

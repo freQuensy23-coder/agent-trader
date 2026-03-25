@@ -15,6 +15,8 @@ class PredictionOutcome:
     direction_correct: bool
     post_id: str
     post_text: str
+    skipped: bool = False
+    skip_reason: str = ""
 
 
 @dataclass
