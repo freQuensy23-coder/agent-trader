@@ -26,7 +26,7 @@ class PostResult:
     outcomes: list[PredictionOutcome]
     agent_cost_usd: float
     agent_turns: int
-    chart_candles: dict[str, list[Candle]]
+    chart_candles: dict[str, list[Candle]]  # key: "{asset}_{timeframe}"
 
 
 @dataclass

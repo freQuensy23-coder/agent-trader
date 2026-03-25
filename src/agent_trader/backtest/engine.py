@@ -240,13 +240,16 @@ class BacktestEngine:
 
         if rec.action == "signal":
             async with httpx.AsyncClient(timeout=30) as direct_client:
-                outcomes = await self.evaluator.evaluate(rec, post, direct_client)
+                try:
+                    outcomes = await self.evaluator.evaluate(rec, post, direct_client)
+                except Exception as e:
+                    logger.error(f"Evaluator failed for post {post.id}: {e}")
                 for pred in rec.predictions:
                     try:
                         candles = await fetch_candles_for_chart(
                             pred.asset, post.created_at_ms, pred.timeframe, direct_client
                         )
-                        chart_candles[pred.asset] = candles
+                        chart_candles[f"{pred.asset}_{pred.timeframe}"] = candles
                     except Exception as e:
                         logger.warning(f"Failed to fetch chart for {pred.asset}: {e}")
 
