@@ -69,6 +69,10 @@ HL_BLOCK = {
 FETCH_SEMAPHORE = asyncio.Semaphore(50)
 
 
+def _fmt(v: float) -> str:
+    return f"{v:.10f}".rstrip("0").rstrip(".")
+
+
 def _json_response(flow: http.HTTPFlow, data, status: int = 200):
     body = json.dumps(data).encode()
     flow.response = http.Response.make(status, body, {"Content-Type": "application/json"})
@@ -311,8 +315,8 @@ class BacktestProxy:
         candles = await fetch_candles(coin, start_time, end_time, interval)
 
         hl_format = [
-            {"t": c.timestamp_ms, "o": str(c.open), "h": str(c.high),
-             "l": str(c.low), "c": str(c.close), "v": str(c.volume)}
+            {"t": c.timestamp_ms, "o": _fmt(c.open), "h": _fmt(c.high),
+             "l": _fmt(c.low), "c": _fmt(c.close), "v": _fmt(c.volume)}
             for c in candles
         ]
         _json_response(flow, hl_format)
@@ -340,7 +344,7 @@ class BacktestProxy:
                 return asset, None
 
         results = await asyncio.gather(*[_get_mid(a) for a in assets])
-        mids = {asset: str(price) for asset, price in results if price is not None}
+        mids = {asset: _fmt(price) for asset, price in results if price is not None}
         _json_response(flow, mids)
 
     async def _hl_intercept_meta_and_ctxs(self, flow: http.HTTPFlow, body: dict, req_type: str):
