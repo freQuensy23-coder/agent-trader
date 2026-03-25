@@ -36,6 +36,8 @@ All requests are POST with JSON body. Key types:
   Full perp metadata across ALL collateral groups (main + builder DEXs). Use this to discover all tradeable assets.
 - `{"type": "allMids"}`
   Current mid-prices for all assets (approximate, based on candle close at current time).
+- `{"type": "metaAndAssetCtxs"}`
+  Perp metadata + live context for ALL assets in one call: markPx, midPx, funding, openInterest, premium.
 
 ### Bybit (GET https://api.bybit.com/v5/market/...)
 - `/kline?category=linear&symbol=BTCUSDT&interval=1&start=<ms>&end=<ms>` — OHLCV candles
