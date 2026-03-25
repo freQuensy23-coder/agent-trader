@@ -6,9 +6,12 @@ from typing import Literal, Self
 from pydantic import BaseModel, Field, model_validator
 
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
 @lru_cache(maxsize=1)
 def _load_valid_assets() -> frozenset[str]:
-    path = Path("data/proxy_snapshots/allPerpMetas.json")
+    path = _PROJECT_ROOT / "data" / "proxy_snapshots" / "allPerpMetas.json"
     if not path.exists():
         return frozenset()
     data = json.loads(path.read_text())
