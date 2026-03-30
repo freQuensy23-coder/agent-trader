@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from loguru import logger
+from weave import op
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
@@ -72,11 +73,11 @@ def _s3_key_for_hour(dt: datetime) -> tuple[str, str]:
     date_str = dt.strftime("%Y%m%d")
     h = dt.hour
     if dt >= _FILLS_BY_BLOCK_START:
-        return "fills_by_block", f"node_fills_by_block/hourly/{date_str}/{h}"
+        return "fills_by_block", f"node_fills_by_block/hourly/{date_str}/{h}.lz4"
     if dt >= _NODE_FILLS_START:
-        return "node_fills", f"node_fills/hourly/{date_str}/{h}"
+        return "node_fills", f"node_fills/hourly/{date_str}/{h}.lz4"
     if dt >= _NODE_TRADES_START:
-        return "node_trades", f"node_trades/hourly/{date_str}/{h}"
+        return "node_trades", f"node_trades/hourly/{date_str}/{h}.lz4"
     return "none", ""
 
 
@@ -193,11 +194,12 @@ def _aggregate_to_candles(
         return []
 
     interval_ms = INTERVAL_SECONDS[interval] * 1000
+    aligned_start = (start_ms // interval_ms) * interval_ms
     buckets: dict[int, list[tuple[int, float, float]]] = defaultdict(list)
 
     for time_ms, price, size in fills:
         bucket = (time_ms // interval_ms) * interval_ms
-        if bucket < start_ms or bucket >= end_ms:
+        if bucket < aligned_start or bucket >= end_ms:
             continue
         buckets[bucket].append((time_ms, price, size))
 
@@ -244,6 +246,7 @@ def _download_hour(s3: "S3Client", s3_key: str) -> bytes:
 # ---------------------------------------------------------------------------
 
 
+@op()
 async def fetch_s3_candles(
     asset: str,
     start_ms: int,

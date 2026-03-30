@@ -1,5 +1,6 @@
 import httpx
 from loguru import logger
+from weave import op
 
 from agent_trader.data.market import fetch_price_change
 from agent_trader.models.outcome import PredictionOutcome
@@ -8,6 +9,7 @@ from agent_trader.models.recommendation import Recommendation
 
 
 class Evaluator:
+    @op()
     async def evaluate(
         self,
         rec: Recommendation,

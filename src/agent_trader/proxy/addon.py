@@ -2,21 +2,28 @@
 mitmproxy addon for backtesting. Intercepts HTTP traffic from the agent sandbox
 and enforces time isolation: the agent cannot see data after backtest time T.
 
-47 endpoints: Bybit (22) + HyperLiquid (25). See docs/mitm.md.
+All intercepted endpoints serve data from local cache — zero outgoing network calls.
+Bybit passthrough endpoints (kline, OI, etc.) are time-capped and forwarded.
 
 Usage:
     mitmdump --listen-port 8080 -s src/agent_trader/proxy/addon.py --set data_dir=data/proxy_snapshots
 """
 
-import asyncio
 import json
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
-import httpx
 from mitmproxy import ctx, http
 
-from agent_trader.data.market import fetch_candles
+from agent_trader.data.bybit import _RENAMES
+from agent_trader.data.cache import (
+    load_cached_candles,
+    load_cached_funding,
+    load_cached_ls_ratio,
+    load_latest_funding,
+    load_latest_ls_ratio,
+    load_nearest_cached_candle,
+)
 
 BYBIT_TIME_CAP_END = {
     "/v5/market/kline",
@@ -28,8 +35,12 @@ BYBIT_TIME_CAP_END = {
 BYBIT_TIME_CAP_ENDTIME = {
     "/v5/market/funding/history",
     "/v5/market/open-interest",
-    "/v5/market/account-ratio",
     "/v5/market/historical-volatility",
+}
+
+BYBIT_INTERCEPT = {
+    "/v5/market/tickers",
+    "/v5/market/account-ratio",
 }
 
 BYBIT_PASSTHROUGH = {
@@ -50,9 +61,10 @@ BYBIT_BLOCK = {
     "/v5/market/adlAlert",
 }
 
-HL_TIME_CAP = {"fundingHistory"}
-
-HL_INTERCEPT = {"candleSnapshot", "allMids", "metaAndAssetCtxs", "spotMetaAndAssetCtxs"}
+HL_INTERCEPT = {
+    "candleSnapshot", "allMids", "metaAndAssetCtxs", "spotMetaAndAssetCtxs",
+    "fundingHistory",
+}
 
 HL_FROM_LOCAL_FILE = {"meta", "allPerpMetas", "spotMeta"}
 
@@ -66,11 +78,21 @@ HL_BLOCK = {
     "allBorrowLendReserveStates", "alignedQuoteTokenInfo", "outcomeMeta",
 }
 
-FETCH_SEMAPHORE = asyncio.Semaphore(50)
+# Reverse symbol map: Bybit base -> HL asset name
+_RENAMES_REVERSE = {v: k for k, v in _RENAMES.items()}
+
+MS_24H = 24 * 60 * 60_000
 
 
 def _fmt(v: float) -> str:
     return f"{v:.10f}".rstrip("0").rstrip(".")
+
+
+def _bybit_symbol_to_hl(symbol: str) -> str | None:
+    if not symbol.endswith("USDT"):
+        return None
+    base = symbol[:-4]
+    return _RENAMES_REVERSE.get(base, base)
 
 
 def _json_response(flow: http.HTTPFlow, data, status: int = 200):
@@ -88,7 +110,6 @@ class BacktestProxy:
     def __init__(self):
         self.T: int | None = None
         self.data_dir: Path | None = None
-        self._client: httpx.AsyncClient | None = None
 
     def load(self, loader):
         loader.add_option("data_dir", str, "", "Path to pre-collected proxy snapshots")
@@ -98,11 +119,6 @@ class BacktestProxy:
             d = ctx.options.data_dir
             if d:
                 self.data_dir = Path(d)
-
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=15)
-        return self._client
 
     async def request(self, flow: http.HTTPFlow):
         host = flow.request.pretty_host
@@ -144,8 +160,8 @@ class BacktestProxy:
             self._bybit_time_cap(flow, "end")
         elif path in BYBIT_TIME_CAP_ENDTIME:
             self._bybit_time_cap(flow, "endTime")
-        elif path == "/v5/market/tickers":
-            await self._bybit_intercept_tickers(flow)
+        elif path in BYBIT_INTERCEPT:
+            self._bybit_intercept(flow, path)
         elif path == "/v5/market/time":
             self._bybit_intercept_time(flow)
         elif path in BYBIT_PASSTHROUGH:
@@ -182,7 +198,13 @@ class BacktestProxy:
             "retExtInfo": {}, "time": self.T,
         })
 
-    async def _bybit_intercept_tickers(self, flow: http.HTTPFlow):
+    def _bybit_intercept(self, flow: http.HTTPFlow, path: str):
+        if path == "/v5/market/tickers":
+            self._bybit_intercept_tickers(flow)
+        elif path == "/v5/market/account-ratio":
+            self._bybit_intercept_account_ratio(flow)
+
+    def _bybit_intercept_tickers(self, flow: http.HTTPFlow):
         if self.T is None:
             _block(flow, "Backtest time not set")
             return
@@ -196,61 +218,102 @@ class BacktestProxy:
             _block(flow, "tickers requires symbol param")
             return
 
+        hl_asset = _bybit_symbol_to_hl(symbol)
+
+        last_price = "0"
+        prev_price_24h = "0"
+        high_24h = "0"
+        low_24h = "0"
+        volume_24h = "0"
+        funding_rate = "0"
+
+        if hl_asset:
+            candles = load_cached_candles(hl_asset, "1m", self.T - 60_000, self.T)
+            if candles:
+                last_price = str(candles[-1].close)
+            elif (nearest := load_nearest_cached_candle(hl_asset, self.T)):
+                last_price = str(nearest.close)
+
+            candles_24h = load_cached_candles(hl_asset, "1m", self.T - MS_24H, self.T)
+            if candles_24h:
+                prev_price_24h = str(candles_24h[0].open)
+                high_24h = str(max(c.high for c in candles_24h))
+                low_24h = str(min(c.low for c in candles_24h))
+                volume_24h = str(sum(c.volume for c in candles_24h))
+
+            fr = load_latest_funding(hl_asset, self.T)
+            if fr is not None:
+                funding_rate = _fmt(fr)
+
+        price_pct = "0"
         try:
-            client = await self._get_client()
+            lp = float(last_price)
+            pp = float(prev_price_24h)
+            if pp > 0:
+                price_pct = _fmt((lp - pp) / pp)
+        except (ValueError, ZeroDivisionError):
+            pass
 
-            kline_resp, funding_resp, oi_resp = await asyncio.gather(
-                client.get("https://api.bybit.com/v5/market/kline", params={
-                    "category": category, "symbol": symbol, "interval": "1",
-                    "end": str(self.T), "limit": "1",
-                }),
-                client.get("https://api.bybit.com/v5/market/funding/history", params={
-                    "category": category, "symbol": symbol,
-                    "endTime": str(self.T), "limit": "1",
-                }),
-                client.get("https://api.bybit.com/v5/market/open-interest", params={
-                    "category": category, "symbol": symbol,
-                    "intervalTime": "5min", "endTime": str(self.T), "limit": "1",
-                }),
-            )
+        ticker = {
+            "symbol": symbol,
+            "lastPrice": last_price,
+            "markPrice": last_price,
+            "indexPrice": last_price,
+            "prevPrice24h": prev_price_24h,
+            "price24hPcnt": price_pct,
+            "highPrice24h": high_24h,
+            "lowPrice24h": low_24h,
+            "turnover24h": "0",
+            "volume24h": volume_24h,
+            "fundingRate": funding_rate,
+            "nextFundingTime": "0",
+            "openInterest": "0",
+            "openInterestValue": "0",
+            "bid1Price": last_price,
+            "bid1Size": "1",
+            "ask1Price": last_price,
+            "ask1Size": "1",
+        }
+        _json_response(flow, {
+            "retCode": 0, "retMsg": "OK",
+            "result": {"category": category, "list": [ticker]},
+            "retExtInfo": {}, "time": self.T,
+        })
 
-            kline_list = kline_resp.json().get("result", {}).get("list", [])
-            last_price = kline_list[0][4] if kline_list else "0"
+    def _bybit_intercept_account_ratio(self, flow: http.HTTPFlow):
+        if self.T is None:
+            _block(flow, "Backtest time not set")
+            return
 
-            funding_list = funding_resp.json().get("result", {}).get("list", [])
-            funding_rate = funding_list[0]["fundingRate"] if funding_list else "0"
+        parsed = urlparse(flow.request.url)
+        params = parse_qs(parsed.query)
+        symbol = params.get("symbol", [None])[0]
+        start_time = int(params.get("startTime", ["0"])[0])
+        end_time = min(int(params.get("endTime", [str(self.T)])[0]), self.T)
 
-            oi_list = oi_resp.json().get("result", {}).get("list", [])
-            oi_value = oi_list[0]["openInterest"] if oi_list else "0"
+        if not symbol:
+            _block(flow, "account-ratio requires symbol param")
+            return
 
-            ticker = {
-                "symbol": symbol,
-                "lastPrice": last_price,
-                "markPrice": last_price,
-                "indexPrice": last_price,
-                "prevPrice24h": last_price,
-                "price24hPcnt": "0",
-                "highPrice24h": last_price,
-                "lowPrice24h": last_price,
-                "turnover24h": "0",
-                "volume24h": "0",
-                "fundingRate": funding_rate,
-                "nextFundingTime": "0",
-                "openInterest": oi_value,
-                "openInterestValue": "0",
-                "bid1Price": last_price,
-                "bid1Size": "1",
-                "ask1Price": last_price,
-                "ask1Size": "1",
-            }
-            _json_response(flow, {
-                "retCode": 0, "retMsg": "OK",
-                "result": {"category": category, "list": [ticker]},
-                "retExtInfo": {}, "time": self.T,
-            })
-        except Exception as e:
-            ctx.log.error(f"tickers intercept failed: {e}")
-            _block(flow, f"tickers intercept failed: {e}")
+        hl_asset = _bybit_symbol_to_hl(symbol)
+        result_list = []
+
+        if hl_asset:
+            entries = load_cached_ls_ratio(hl_asset, start_time, end_time)
+            if entries:
+                for ts, buy, sell in entries:
+                    result_list.append({
+                        "symbol": symbol,
+                        "buyRatio": str(buy),
+                        "sellRatio": str(sell),
+                        "timestamp": str(ts),
+                    })
+
+        _json_response(flow, {
+            "retCode": 0, "retMsg": "OK",
+            "result": {"list": result_list},
+            "retExtInfo": {}, "time": self.T,
+        })
 
     # --- HyperLiquid ---
 
@@ -267,9 +330,7 @@ class BacktestProxy:
 
         req_type = body.get("type", "")
 
-        if req_type in HL_TIME_CAP:
-            self._hl_time_cap(flow, body, req_type)
-        elif req_type in HL_INTERCEPT:
+        if req_type in HL_INTERCEPT:
             await self._hl_intercept(flow, body, req_type)
         elif req_type in HL_FROM_LOCAL_FILE:
             self._hl_from_local_file(flow, body, req_type)
@@ -280,39 +341,34 @@ class BacktestProxy:
         else:
             _block(flow, f"Unknown HyperLiquid type: {req_type}")
 
-    def _hl_time_cap(self, flow: http.HTTPFlow, body: dict, req_type: str):
-        if self.T is None:
-            _block(flow, "Backtest time not set")
-            return
-
-        if req_type == "fundingHistory":
-            current_end = body.get("endTime")
-            if current_end is None or int(current_end) > self.T:
-                body["endTime"] = self.T
-
-        flow.request.content = json.dumps(body).encode()
-
     async def _hl_intercept(self, flow: http.HTTPFlow, body: dict, req_type: str):
         if self.T is None:
             _block(flow, "Backtest time not set")
             return
 
         if req_type == "candleSnapshot":
-            await self._hl_intercept_candles(flow, body)
+            self._hl_intercept_candles(flow, body)
         elif req_type == "allMids":
-            await self._hl_intercept_all_mids(flow)
+            self._hl_intercept_all_mids(flow)
         elif req_type in ("metaAndAssetCtxs", "spotMetaAndAssetCtxs"):
-            await self._hl_intercept_meta_and_ctxs(flow, body, req_type)
+            self._hl_intercept_meta_and_ctxs(flow, body, req_type)
+        elif req_type == "fundingHistory":
+            self._hl_intercept_funding_history(flow, body)
 
-    async def _hl_intercept_candles(self, flow: http.HTTPFlow, body: dict):
-
+    def _hl_intercept_candles(self, flow: http.HTTPFlow, body: dict):
         req = body.get("req", {})
         coin = req.get("coin", "")
         interval = req.get("interval", "1m")
         start_time = int(req.get("startTime", 0))
         end_time = min(int(req.get("endTime", self.T)), self.T)
 
-        candles = await fetch_candles(coin, start_time, end_time, interval)
+        from agent_trader.data.cache import load_cached_candles_via_aggregation
+
+        candles = load_cached_candles(coin, interval, start_time, end_time)
+        if not candles and interval != "1m":
+            candles = load_cached_candles_via_aggregation(coin, interval, start_time, end_time)
+        if not candles:
+            candles = []
 
         hl_format = [
             {"t": c.timestamp_ms, "o": _fmt(c.open), "h": _fmt(c.high),
@@ -321,8 +377,7 @@ class BacktestProxy:
         ]
         _json_response(flow, hl_format)
 
-    async def _hl_intercept_all_mids(self, flow: http.HTTPFlow):
-
+    def _hl_intercept_all_mids(self, flow: http.HTTPFlow):
         if not self.data_dir or not (self.data_dir / "allPerpMetas.json").exists():
             _block(flow, "allPerpMetas.json not found. Run: python scripts/collect_snapshots.py")
             return
@@ -333,22 +388,17 @@ class BacktestProxy:
             for u in group.get("universe", []):
                 assets.append(u["name"])
 
-        async def _get_mid(asset: str) -> tuple[str, str | None]:
-            async with FETCH_SEMAPHORE:
-                try:
-                    candles = await fetch_candles(asset, self.T - 60_000, self.T, "1m")
-                    if candles:
-                        return asset, candles[-1].close
-                except Exception:
-                    pass
-                return asset, None
+        mids = {}
+        for asset in assets:
+            candles = load_cached_candles(asset, "1m", self.T - 60_000, self.T)
+            if candles:
+                mids[asset] = _fmt(candles[-1].close)
+            elif (nearest := load_nearest_cached_candle(asset, self.T)):
+                mids[asset] = _fmt(nearest.close)
 
-        results = await asyncio.gather(*[_get_mid(a) for a in assets])
-        mids = {asset: _fmt(price) for asset, price in results if price is not None}
         _json_response(flow, mids)
 
-    async def _hl_intercept_meta_and_ctxs(self, flow: http.HTTPFlow, body: dict, req_type: str):
-
+    def _hl_intercept_meta_and_ctxs(self, flow: http.HTTPFlow, body: dict, req_type: str):
         if req_type == "spotMetaAndAssetCtxs":
             if self.data_dir and (self.data_dir / "spotMeta.json").exists():
                 data = json.loads((self.data_dir / "spotMeta.json").read_text())
@@ -364,50 +414,51 @@ class BacktestProxy:
         meta = json.loads((self.data_dir / "meta.json").read_text())
         assets = [u["name"] for u in meta.get("universe", [])]
 
-        async def _get_ctx(asset: str) -> dict:
-            async with FETCH_SEMAPHORE:
-                mark_price = None
-                funding = "0"
-                open_interest = "0"
-                try:
-                    candles = await fetch_candles(asset, self.T - 60_000, self.T, "1m")
-                    if candles:
-                        mark_price = _fmt(candles[-1].close)
-                except Exception:
-                    pass
+        ctxs = []
+        for asset in assets:
+            mark_price = "0"
+            funding = "0"
 
-                if mark_price is None:
-                    mark_price = "0"
+            candles = load_cached_candles(asset, "1m", self.T - 60_000, self.T)
+            if candles:
+                mark_price = _fmt(candles[-1].close)
+            elif (nearest := load_nearest_cached_candle(asset, self.T)):
+                mark_price = _fmt(nearest.close)
 
-                try:
-                    client = await self._get_client()
-                    resp = await client.post("https://api.hyperliquid.xyz/info", json={
-                        "type": "fundingHistory", "coin": asset,
-                        "startTime": self.T - 8 * 3600_000, "endTime": self.T,
-                    })
-                    fh = resp.json()
-                    if fh:
-                        funding = fh[-1].get("fundingRate", "0")
-                except Exception:
-                    pass
+            fr = load_latest_funding(asset, self.T)
+            if fr is not None:
+                funding = _fmt(fr)
 
-                return {
-                    "funding": funding,
-                    "openInterest": open_interest,
-                    "prevDayPx": mark_price,
-                    "dayNtlVlm": "0",
-                    "premium": "0",
-                    "oraclePx": mark_price,
-                    "markPx": mark_price,
-                    "midPx": mark_price,
-                    "impactPxs": [mark_price, mark_price],
-                }
+            ctxs.append({
+                "funding": funding,
+                "openInterest": "0",
+                "prevDayPx": mark_price,
+                "dayNtlVlm": "0",
+                "premium": "0",
+                "oraclePx": mark_price,
+                "markPx": mark_price,
+                "midPx": mark_price,
+                "impactPxs": [mark_price, mark_price],
+            })
 
-        ctxs = await asyncio.wait_for(
-            asyncio.gather(*[_get_ctx(a) for a in assets]),
-            timeout=60,
-        )
-        _json_response(flow, [meta, list(ctxs)])
+        _json_response(flow, [meta, ctxs])
+
+    def _hl_intercept_funding_history(self, flow: http.HTTPFlow, body: dict):
+        coin = body.get("coin", "")
+        start_time = int(body.get("startTime", 0))
+        end_time = min(int(body.get("endTime", self.T)), self.T)
+
+        entries = load_cached_funding(coin, start_time, end_time)
+
+        if entries is None:
+            _json_response(flow, [])
+            return
+
+        result = [
+            {"coin": coin, "fundingRate": _fmt(rate), "premium": "0", "time": ts}
+            for ts, rate in entries
+        ]
+        _json_response(flow, result)
 
     def _hl_from_local_file(self, flow: http.HTTPFlow, body: dict, req_type: str):
         if self.data_dir is None:

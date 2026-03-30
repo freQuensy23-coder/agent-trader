@@ -12,6 +12,7 @@ import httpx
 import weave
 from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 from loguru import logger
+from weave import op
 
 from agent_trader.agent.prompts import build_system_prompt, build_user_prompt
 from agent_trader.agent.tool import create_recommendation_tool
@@ -189,6 +190,7 @@ class BacktestEngine:
         tasks = [process_one(pp) for pp in prepared]
         return list(await asyncio.gather(*tasks))
 
+    @op()
     async def _process_post(self, pp: PreparedPost, worker: Worker) -> PostResult:
         post = pp.post
 

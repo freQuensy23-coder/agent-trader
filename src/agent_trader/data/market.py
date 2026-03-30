@@ -1,6 +1,7 @@
 import httpx
 from loguru import logger
 from pydantic import BaseModel
+from weave import op
 
 from agent_trader.constants import CHART_WINDOW, TIMEFRAME_MS
 
@@ -72,6 +73,7 @@ async def _fetch_hl_candles(
     return all_candles
 
 
+@op()
 async def fetch_candles(
     asset: str,
     start_ms: int,
@@ -86,6 +88,14 @@ async def fetch_candles(
     if cached:
         logger.debug(f"Cache hit: {asset}/{interval} ({len(cached)} candles)")
         return cached
+
+    if interval != "1m":
+        from agent_trader.data.cache import load_cached_candles_via_aggregation
+
+        aggregated = load_cached_candles_via_aggregation(asset, interval, start_ms, end_ms)
+        if aggregated:
+            logger.debug(f"Aggregated from 1m: {asset}/{interval} ({len(aggregated)} candles)")
+            return aggregated
 
     candles = await fetch_bybit_candles(asset, start_ms, end_ms, interval, client)
     if candles:
@@ -115,6 +125,7 @@ async def fetch_candles(
     return []
 
 
+@op()
 async def fetch_price_change(
     asset: str,
     from_ms: int,
@@ -137,6 +148,7 @@ async def fetch_price_change(
     return price_at_post, price_after, change_pct
 
 
+@op()
 async def fetch_candles_for_chart(
     asset: str,
     post_ms: int,

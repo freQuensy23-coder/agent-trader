@@ -1,5 +1,6 @@
 import httpx
 from loguru import logger
+from weave import op
 
 from agent_trader.data.market import Candle
 
@@ -42,6 +43,7 @@ def hl_to_bybit_symbol(hl_asset: str) -> str | None:
     return f"{base}USDT"
 
 
+@op()
 async def fetch_bybit_candles(
     hl_asset: str,
     start_ms: int,

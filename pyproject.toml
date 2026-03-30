@@ -20,6 +20,7 @@ dependencies = [
     "mitmproxy>=12.2.1",
     "boto3>=1.35",
     "lz4>=4.3",
+    "tqdm>=4.67.3",
 ]
 
 [project.optional-dependencies]

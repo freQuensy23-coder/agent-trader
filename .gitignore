@@ -1,8 +1,45 @@
-.venv
-.env
-ralf.sh
+# Python bytecode and caches
 __pycache__/
+*.py[cod]
+*.pyc.*
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Coverage and build artifacts
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Local environment and logs
+.env
+.env.*
+!.env.example
+!.env.sample
+*.log
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+
+# Project-specific generated files
+ralf.sh
 data/news/
 data/cache/
 data/results/
-
