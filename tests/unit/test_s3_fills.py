@@ -48,21 +48,21 @@ def test_key_fills_by_block():
     dt = datetime(2025, 8, 15, 14, tzinfo=timezone.utc)
     fmt, key = _s3_key_for_hour(dt)
     assert fmt == "fills_by_block"
-    assert key == "node_fills_by_block/hourly/20250815/14"
+    assert key == "node_fills_by_block/hourly/20250815/14.lz4"
 
 
 def test_key_node_fills():
     dt = datetime(2025, 6, 10, 3, tzinfo=timezone.utc)
     fmt, key = _s3_key_for_hour(dt)
     assert fmt == "node_fills"
-    assert key == "node_fills/hourly/20250610/3"
+    assert key == "node_fills/hourly/20250610/3.lz4"
 
 
 def test_key_node_trades():
     dt = datetime(2025, 4, 1, 0, tzinfo=timezone.utc)
     fmt, key = _s3_key_for_hour(dt)
     assert fmt == "node_trades"
-    assert key == "node_trades/hourly/20250401/0"
+    assert key == "node_trades/hourly/20250401/0.lz4"
 
 
 def test_key_too_old():

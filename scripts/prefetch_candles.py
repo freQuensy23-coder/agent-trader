@@ -2,10 +2,11 @@
 
 Downloads:
   1. 1m candles from Bybit (229 perp assets)
-  2. 1m candles from S3 fills (146 builder DEX assets)
+  2. 1m candles from HL API (146 builder DEX assets)
   3. Funding rates from Bybit (229 perp assets)
   4. Funding rates from HL API (146 builder DEX assets)
   5. Long/short ratios from Bybit (229 perp assets)
+  6. (optional) 1m candles from S3 fills (builder DEX)
 
 Usage:
     uv run python scripts/prefetch_candles.py
@@ -381,6 +382,66 @@ async def fetch_s3_dex_candles(
 
 
 # ---------------------------------------------------------------------------
+# 2b. HL candles for builder DEX assets
+# ---------------------------------------------------------------------------
+
+MAX_HL_CANDLES_PER_REQ = 500
+
+
+async def fetch_hl_candles(
+    asset: str, start_ms: int, end_ms: int,
+    client: httpx.AsyncClient, semaphore: asyncio.Semaphore, pbar: tqdm,
+) -> int:
+    """Download 1m candles from HL candleSnapshot API for a builder DEX asset."""
+    cached = _get_cached_range(_candle_cache_path(asset))
+    if cached and cached[0] <= start_ms and cached[1] >= end_ms - MS_PER_MINUTE:
+        pbar.update(1)
+        return 0
+
+    all_rows = []
+    cursor = start_ms
+
+    while cursor < end_ms:
+        async with semaphore:
+            for attempt in range(3):
+                try:
+                    resp = await client.post(HL_INFO_URL, json={
+                        "type": "candleSnapshot",
+                        "req": {
+                            "coin": asset, "interval": "1m",
+                            "startTime": cursor, "endTime": end_ms,
+                        },
+                    })
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
+                except Exception:
+                    if attempt == 2:
+                        data = []
+                    await asyncio.sleep(1 * (attempt + 1))
+
+        if not data:
+            break
+
+        for c in data:
+            ts = c["t"]
+            if start_ms <= ts < end_ms:
+                all_rows.append([ts, float(c["o"]), float(c["h"]),
+                                 float(c["l"]), float(c["c"]), float(c["v"])])
+
+        if len(data) < MAX_HL_CANDLES_PER_REQ:
+            break
+        cursor = data[-1]["t"] + 1
+
+    if all_rows:
+        df = pd.DataFrame(all_rows, columns=["timestamp_ms", "open", "high", "low", "close", "volume"])
+        _save_parquet(_candle_cache_path(asset), df)
+
+    pbar.update(1)
+    return len(all_rows)
+
+
+# ---------------------------------------------------------------------------
 # 3. Bybit funding
 # ---------------------------------------------------------------------------
 
@@ -560,7 +621,8 @@ async def main(months: int = 12, concurrency: int = 10, skip_s3: bool = False):
         pbar_candles = tqdm(total=len(bybit_pairs), desc="Candles", unit="asset", position=0)
         pbar_funding = tqdm(total=len(bybit_pairs), desc="Funding", unit="asset", position=1)
         pbar_ls = tqdm(total=len(bybit_pairs), desc="L/S Ratio", unit="asset", position=2)
-        pbar_hl = tqdm(total=len(dex_assets), desc="HL Funding", unit="asset", position=3) if dex_assets else None
+        pbar_hl_funding = tqdm(total=len(dex_assets), desc="HL Funding", unit="asset", position=3) if dex_assets else None
+        pbar_hl_candles = tqdm(total=len(dex_assets), desc="HL Candles", unit="asset", position=4) if dex_assets else None
 
         all_tasks = []
 
@@ -570,22 +632,29 @@ async def main(months: int = 12, concurrency: int = 10, skip_s3: bool = False):
             for a, s in bybit_pairs
         ])
 
-        # 2. Bybit funding
+        # 2. HL 1m candles for builder DEX
+        if dex_assets:
+            all_tasks.extend([
+                fetch_hl_candles(a, start_ms, end_ms, client, semaphore, pbar_hl_candles)
+                for a in dex_assets
+            ])
+
+        # 3. Bybit funding
         all_tasks.extend([
             fetch_bybit_funding(a, s, start_ms, end_ms, client, semaphore, pbar_funding)
             for a, s in bybit_pairs
         ])
 
-        # 3. Bybit long/short ratio
+        # 4. Bybit long/short ratio
         all_tasks.extend([
             fetch_bybit_ls_ratio(a, s, start_ms, end_ms, client, semaphore, pbar_ls)
             for a, s in bybit_pairs
         ])
 
-        # 4. HL funding for builder DEX
+        # 5. HL funding for builder DEX
         if dex_assets:
             all_tasks.extend([
-                fetch_hl_funding(a, start_ms, end_ms, client, semaphore, pbar_hl)
+                fetch_hl_funding(a, start_ms, end_ms, client, semaphore, pbar_hl_funding)
                 for a in dex_assets
             ])
 
@@ -595,10 +664,12 @@ async def main(months: int = 12, concurrency: int = 10, skip_s3: bool = False):
         pbar_candles.close()
         pbar_funding.close()
         pbar_ls.close()
-        if pbar_hl:
-            pbar_hl.close()
+        if pbar_hl_funding:
+            pbar_hl_funding.close()
+        if pbar_hl_candles:
+            pbar_hl_candles.close()
 
-        # 5. S3 builder DEX candles (separate — uses boto3, not httpx)
+        # 6. S3 builder DEX candles (optional, separate — uses boto3, not httpx)
         if dex_assets and not skip_s3:
             print(f"\nS3 builder DEX candles ({len(dex_assets)} assets)")
             s3_results = await fetch_s3_dex_candles(dex_assets, start_ms, end_ms, concurrency)
